@@ -1,0 +1,1356 @@
+
+# -*- coding: utf-8 -*-
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import tkinter.font as tkfont
+import csv, copy, re, os, sys, json, math
+from typing import Dict, Any, List, Optional
+
+# ---- 基本設定 ----
+MAX_DEPTH = 10
+APP_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
+CONFIG_PATH = os.path.join(APP_DIR, "anbun_config.json")
+MAX_NODE_NAME_WIDTH = 520
+MAX_MEASURE_NAME_WIDTH= 520
+MAX_ASSIGN_NAME_WIDTH = 460
+MAX_DETAIL2_WIDTH = 520
+PADDING = 28
+SAMPLE_ROWS_FOR_MEASURE = 2000
+APP_NAME = 'あんぶんくん'
+APP_SUBTITLE = '電力量配分ツリー'
+saved_node_name_width: Optional[int] = None
+saved_measure_name_width: Optional[int] = None
+saved_assign_name_width: Optional[int] = None
+saved_detail2_width: Optional[int] = None
+MGMT_CFG_DEFAULTS = {
+    "parent_child_tolerance_percent": 1.0,
+    "over_power_threshold_percent_of_max": 40.0,
+    "negative_anbun_threshold_kwh": -0.1
+}
+MGMT_CFG = dict(MGMT_CFG_DEFAULTS)
+CALC_METHOD_CHOICES = ('実測', '按分', '合算')
+DISPLAY_METHOD_CHOICES = ('', '実測', '合算', '按分', '按分(確定)')
+TREE_ROW_LABEL = 'ツリー行'
+
+# ノードの開閉状態（階層単位）
+depth_open_state: Dict[int, bool] = {d: True for d in range(MAX_DEPTH + 1)}
+
+def _depth_color(d:int)->str:
+    colors=['#e8f0ff','#e0ffe0','#fff0cc','#f0e0ff','#d0f0d0','#f5f5f5','#e8fff8']
+    return colors[d % len(colors)]
+
+# ---- データモデル ----
+class FlatNode:
+    def __init__(self, name, calc_method="按分", at="", measure_name="", ratio="", unit="",
+                 energy=0, depth=0, assign_name="", budget_unit="",
+                 electric_room="", transformer="", notes="",
+                 detail1="", detail2="", category1="", category2="", category3=""):
+        self.name=name; self.calc_method=calc_method; self.at=at
+        self.measure_name=measure_name; self.unit=unit
+        try:
+            self.ratio=float(ratio) if ratio not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            self.ratio=0.0
+        try:
+            self.energy=float(energy) if energy not in (None, "") else 0.0
+        except (TypeError, ValueError):
+            self.energy=0.0
+        self.depth=depth; self.assign_name=assign_name; self.budget_unit=budget_unit
+        self.electric_room=electric_room; self.transformer=transformer; self.notes=notes
+        self.detail1=detail1; self.detail2=detail2
+        self.category1=category1; self.category2=category2; self.category3=category3
+
+# サンプル（起動確認用）
+flat_nodes = [
+    FlatNode("変圧器二次メーター", "実測", "1000", "メーター", "1000", "", 1800, 0),
+    FlatNode("ブレーカーA", "按分", "150", "ブレーカー", "150", "", 642.86, 1),
+    FlatNode("ブレーカーAA", "按分", "75", "ブレーカー", "75", "", 136.87, 2),
+    FlatNode("ブレーカーAB", "按分", "200", "ブレーカー", "200", "", 364.99, 2),
+    FlatNode("ブレーカーAC", "合算", "100", "ブレーカー", "100", "", 141.0, 2),
+    FlatNode("装置A", "実測", "15", "装置", "15", "", 88.0, 3),
+    FlatNode("装置B", "実測", "30", "装置", "30", "", 38.0, 3),
+    FlatNode("装置C", "実測", "15", "装置", "15", "", 15.0, 3),
+    FlatNode("ブレーカーB", "按分", "150", "ブレーカー", "150", "", 964.29, 1),
+    FlatNode("ブレーカーC", "按分", "30", "ブレーカー", "30", "", 192.86, 1),
+]
+
+# マスタ（キーは normalize_key 済みで保存する）
+measure_master: Dict[str, Dict[str, Any]] = {}
+distribution_master: Dict[str, Dict[str, Any]] = {}
+measure_name_options = {n.measure_name for n in flat_nodes if n.measure_name}
+
+# ---- 設定（幅・管理条件） ----
+def load_config():
+    global saved_node_name_width, saved_measure_name_width, saved_assign_name_width, saved_detail2_width, MGMT_CFG
+    try:
+        data = {}
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        for key, var, cap in [
+            ('node_name_width','saved_node_name_width',MAX_NODE_NAME_WIDTH),
+            ('measure_name_width','saved_measure_name_width',MAX_MEASURE_NAME_WIDTH),
+            ('assign_name_width','saved_assign_name_width',MAX_ASSIGN_NAME_WIDTH),
+            ('detail2_width','saved_detail2_width',MAX_DETAIL2_WIDTH)
+        ]:
+            w = data.get(key, None)
+            if isinstance(w, int) and w>0:
+                globals()[var] = min(w, cap)
+        mg = data.get('management', {})
+        if isinstance(mg, dict):
+            tmp = dict(MGMT_CFG)
+            for k in ("parent_child_tolerance_percent","over_power_threshold_percent_of_max","negative_anbun_threshold_kwh"):
+                if k in mg and isinstance(mg[k], (int,float)):
+                    tmp[k] = float(mg[k])
+            MGMT_CFG = tmp
+    except Exception as e:
+        print('[CONFIG] 読み込み失敗:', e)
+
+def save_config():
+    try:
+        base = {}
+        if os.path.exists(CONFIG_PATH):
+            try:
+                with open(CONFIG_PATH,'r',encoding='utf-8') as f: base = json.load(f) or {}
+            except Exception: base={}
+        if 'management' not in base or not isinstance(base['management'], dict):
+            base['management'] = {}
+        if tree is not None:
+            def _w(nm, default):
+                try: return int(tree.column(nm,'width'))
+                except: return default or 0
+            base['node_name_width'] = _w('#0', saved_node_name_width)
+            base['measure_name_width'] = _w('計量名称', saved_measure_name_width)
+            base['assign_name_width'] = _w('割り振り先', saved_assign_name_width)
+            base['detail2_width'] = _w('詳細２', saved_detail2_width)
+            base['management']['parent_child_tolerance_percent'] = float(MGMT_CFG.get('parent_child_tolerance_percent', MGMT_CFG_DEFAULTS['parent_child_tolerance_percent']))
+            base['management']['over_power_threshold_percent_of_max'] = float(MGMT_CFG.get('over_power_threshold_percent_of_max', MGMT_CFG_DEFAULTS['over_power_threshold_percent_of_max']))
+            base['management']['negative_anbun_threshold_kwh'] = float(MGMT_CFG.get('negative_anbun_threshold_kwh', MGMT_CFG_DEFAULTS['negative_anbun_threshold_kwh']))
+        with open(CONFIG_PATH,'w',encoding='utf-8') as f:
+            json.dump(base,f,ensure_ascii=False,indent=2)
+        print('[CONFIG] 保存:', CONFIG_PATH)
+    except Exception as e:
+        print('[CONFIG] 保存失敗:', e)
+
+# ---- ユーティリティ ----
+_num_pattern = re.compile(r"[\+\-]?\d*\.?\d+(?:[eE][\+\-]?\d+)?")
+
+def extract_number(val, default=None):
+    if val is None: return default
+    if isinstance(val, (int,float)): return float(val)
+    m = _num_pattern.search(str(val)); return float(m.group()) if m else default
+
+def format_at_display(val):
+    num = extract_number(val, None)
+    return str(int(round(num))) if num is not None else ("" if val is None else str(val))
+
+def format_energy_display(val):
+    try: return f"{float(val):,.1f} kWh"
+    except (TypeError, ValueError): return ""
+
+def normalize_value(v):
+    if v is None: return ""
+    s=str(v).replace('\ufeff','').replace('\u00A0',' ')
+    s=s.replace('\r\n',' ').replace('\r',' ').replace('\n',' ')
+    s=re.sub(r"\s+"," ",s)
+    return s.strip()
+
+def normalize_key(v):
+    s=normalize_value(v)
+    s=s.replace('（','(').replace('）',')')
+    return s
+
+_excel_date_like = re.compile(r'^\d{1,4}([\-/]\d{1,2}){1,2}$')
+
+def excel_safe_text(v):
+    if v is None: return ""
+    s=str(v)
+    if s[:1] in ('=','+','-','@') or _excel_date_like.match(s): s="'"+s
+    return s
+
+# ---- CSVユーティリティ ----
+def normalize_header(s:str)->str:
+    if s is None: return ''
+    s=s.replace('\ufeff','').replace('（','(').replace('）',')'); return s.strip()
+
+def read_csv_dicts_with_fallback(path:str)->List[Dict[str,Any]]:
+    for enc in ('utf-8-sig','cp932','utf-8'):
+        try:
+            with open(path,'r',encoding=enc,newline='') as f:
+                reader=csv.DictReader(f); rows=[]
+                for row in reader:
+                    if not row: continue
+                    norm={}; empty=True
+                    for k,v in row.items():
+                        if k is None: continue
+                        nk=normalize_header(k); nv=normalize_value(v)
+                        if nv!='': empty=False; norm[nk]=nv
+                    if not empty: rows.append(norm)
+                print(f"[CSV] '{path}' 読み込み成功（{enc}）: {len(rows)}行"); return rows
+        except Exception as e:
+            print(f"[CSV] '{path}' 読み込み失敗（{enc}）: {e}")
+    print(f"[CSV] '{path}' 読み込みに失敗しました。"); return []
+
+# ---- 量・比率CSV / 割り振り先CSV の参照 ----
+def get_measure_master_amount(measure_name: str, default: float = 0.0) -> float:
+    key = normalize_key(measure_name).strip()
+    if not key or key not in measure_master:
+        return default
+    try:
+        return float(measure_master[key].get('量・比率(元)', default))
+    except (TypeError, ValueError):
+        return default
+
+def apply_masters_from_csv():
+    for n in flat_nodes:
+        key = normalize_key(n.measure_name).strip()
+        if key and key in measure_master:
+            src = measure_master[key]
+            if n.calc_method == '按分':
+                n.ratio = float(src.get('量・比率(元)', n.ratio))
+                n.unit = src.get('単位(元)', n.unit)
+        assign = normalize_key(n.assign_name).strip()
+        if assign and assign in distribution_master:
+            n.budget_unit = distribution_master[assign].get('予算単位(元)', n.budget_unit)
+
+def sanitize_calc_method(value: str) -> str:
+    method = normalize_value(value)
+    return method if method in CALC_METHOD_CHOICES else '按分'
+
+def apply_measure_master_to_node(node: FlatNode):
+    key = normalize_key(node.measure_name).strip()
+    if key not in measure_master:
+        if node.calc_method == '実測':
+            node.energy = 0.0
+        return
+    src = measure_master[key]
+    if node.calc_method == '実測':
+        node.energy = get_measure_master_amount(node.measure_name, 0.0)
+    elif node.calc_method == '按分':
+        node.ratio = float(src.get('量・比率(元)', node.ratio))
+        node.unit = src.get('単位(元)', node.unit)
+
+# ---- 計算 ----
+def calculate_energy():
+    for node in flat_nodes:
+        node.energy = 0.0
+    for node in flat_nodes:
+        if node.calc_method == '実測':
+            node.energy = get_measure_master_amount(node.measure_name, 0.0)
+    # 合算（深→浅）
+    for depth in reversed(range(MAX_DEPTH+1)):
+        for i,node in enumerate(flat_nodes):
+            if node.depth==depth and node.calc_method=='合算':
+                total=0.0
+                for j in range(i+1,len(flat_nodes)):
+                    c=flat_nodes[j]
+                    if c.depth==node.depth+1: total+=c.energy
+                    elif c.depth<=node.depth: break
+                node.energy=total
+    # 按分（浅→深）
+    for depth in range(MAX_DEPTH+1):
+        for i,node in enumerate(flat_nodes):
+            if node.depth==depth:
+                children=[]
+                for j in range(i+1,len(flat_nodes)):
+                    c=flat_nodes[j]
+                    if c.depth==depth+1: children.append(c)
+                    elif c.depth<=depth: break
+                anb=[c for c in children if c.calc_method=='按分']
+                settled=[c for c in children if c.calc_method in ['実測','合算']]
+                fixed_total=sum(c.energy for c in settled)
+                ratio_total=sum(c.ratio for c in anb)
+                remaining=node.energy-fixed_total
+                for c in anb:
+                    c.energy = (remaining * c.ratio / ratio_total) if ratio_total>0 else 0.0
+
+# ---- 表示用：算出方法（按分(確定) の付与） ----
+def get_parent_index(index:int)->Optional[int]:
+    if index<=0: return None
+    base=flat_nodes[index].depth
+    for j in range(index-1,-1,-1):
+        if flat_nodes[j].depth==base-1: return j
+        elif flat_nodes[j].depth<base-1: break
+    return None
+
+def get_direct_children(index:int)->List[FlatNode]:
+    base=flat_nodes[index].depth; out=[]
+    for j in range(index+1,len(flat_nodes)):
+        c=flat_nodes[j]
+        if c.depth==base+1: out.append(c)
+        elif c.depth<=base: break
+    return out
+
+def get_subtree_end_index(index:int)->int:
+    base_depth = flat_nodes[index].depth
+    end = index + 1
+    while end < len(flat_nodes) and flat_nodes[end].depth > base_depth:
+        end += 1
+    return end
+
+def get_subtree_indices(index:int)->range:
+    return range(index, get_subtree_end_index(index))
+
+def move_subtree(index:int, up:bool=True)->bool:
+    depth = flat_nodes[index].depth
+    subtree_end = get_subtree_end_index(index)
+    if up:
+        scan = index - 1
+        while scan >= 0 and flat_nodes[scan].depth > depth:
+            scan -= 1
+        if scan < 0 or flat_nodes[scan].depth != depth:
+            return False
+        sibling_start = scan
+        sibling_end = index
+        moving = flat_nodes[index:subtree_end]
+        previous = flat_nodes[sibling_start:sibling_end]
+        flat_nodes[sibling_start:subtree_end] = moving + previous
+        return True
+    scan = subtree_end
+    while scan < len(flat_nodes) and flat_nodes[scan].depth > depth:
+        scan += 1
+    if scan >= len(flat_nodes) or flat_nodes[scan].depth != depth:
+        return False
+    next_end = get_subtree_end_index(scan)
+    moving = flat_nodes[index:subtree_end]
+    next_sibling = flat_nodes[subtree_end:next_end]
+    flat_nodes[index:next_end] = next_sibling + moving
+    return True
+
+def change_subtree_depth(index:int, increase:bool=True)->bool:
+    current_depth = flat_nodes[index].depth
+    delta = 1 if increase else -1
+    new_depth = current_depth + delta
+    if new_depth < 0 or new_depth > MAX_DEPTH:
+        return False
+    if increase:
+        if index == 0:
+            return False
+        prev_depth = flat_nodes[index - 1].depth
+        if new_depth > prev_depth + 1:
+            return False
+    for i in get_subtree_indices(index):
+        flat_nodes[i].depth += delta
+    return True
+
+def insert_node_after_selection(selected_index: Optional[int])->int:
+    if selected_index is None:
+        depth = 0
+        pos = len(flat_nodes)
+    else:
+        depth = flat_nodes[selected_index].depth
+        pos = get_subtree_end_index(selected_index)
+    new = FlatNode('新規ノード','按分','', '', 0, '', 0, depth)
+    flat_nodes.insert(pos,new)
+    return pos
+
+def delete_subtree(index:int)->int:
+    end = get_subtree_end_index(index)
+    count = end - index
+    del flat_nodes[index:end]
+    return count
+
+def get_display_method(index:int)->str:
+    node=flat_nodes[index]
+    m = node.calc_method
+    if m != '按分': return m
+    p = get_parent_index(index)
+    if p is None: return m
+    parent_disp = get_display_method(p)
+    if parent_disp in ('実測','按分(確定)'):
+        children = get_direct_children(p)
+        anbun_children = [c for c in children if c.calc_method=='按分']
+        if len(anbun_children)==1 and anbun_children[0] is node:
+            return '按分(確定)'
+    return m
+
+METHOD_ICON={'実測':'🧿','合算':'➕','按分':'📊','按分(確定)':'📊✅'}
+
+def method_with_icon(m): return f"{METHOD_ICON.get(m,'')} {m}".strip()
+
+def notes_with_icon(n):
+    n=normalize_value(n); return f"📄 {n}" if n else ""
+
+# ---- GUI 構築 ----
+root=tk.Tk(); root.title(f'{APP_NAME} - {APP_SUBTITLE}')
+columns=(
+    '詳細１','詳細２','行番号','算出方法','AT','計量名称','按分比率','按分単位','電力量',
+    '割り振り先','予算単位','電気室','変圧器','備考','分類１','分類２','分類３',
+    '管理(親子差大)','管理(過大電力)','管理(負按分)','管理(呼出不可)'
+)
+column_attr_map={'行番号':None,'詳細１':'detail1','詳細２':'detail2','算出方法':'calc_method','AT':'at','計量名称':'measure_name','按分比率':'ratio','按分単位':'unit','電力量':'energy','割り振り先':'assign_name','電気室':'electric_room','変圧器':'transformer','備考':'notes','分類１':'category1','分類２':'category2','分類３':'category3','管理(親子差大)':None,'管理(過大電力)':None,'管理(負按分)':None,'管理(呼出不可)':None}
+
+main_frame=ttk.Frame(root); main_frame.pack(fill='both',expand=True)
+tree=ttk.Treeview(main_frame, columns=columns, show='tree headings')
+vsb=ttk.Scrollbar(main_frame, orient='vertical', command=tree.yview)
+hsb=ttk.Scrollbar(main_frame, orient='horizontal', command=tree.xview)
+tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+tree.grid(row=0,column=0,sticky='nsew'); vsb.grid(row=0,column=1,sticky='ns'); hsb.grid(row=1,column=0,sticky='ew')
+main_frame.rowconfigure(0,weight=1); main_frame.columnconfigure(0,weight=1)
+style=ttk.Style()
+base_font = tkfont.nametofont('TkDefaultFont')
+tree_row_height = max(30, int(base_font.metrics('linespace')) + 10)
+style.configure('Treeview', rowheight=tree_row_height)
+style.configure('Treeview.Heading', padding=(4, 4))
+tree.heading('#0', text='ノード名')
+for c in columns: tree.heading(c, text=c)
+node_ids: Dict[int,str] = {}
+
+def open_combobox_dropdown(combo: ttk.Combobox):
+    combo.focus_set()
+    def _open():
+        try:
+            combo.tk.call('ttk::combobox::Post', combo)
+        except tk.TclError:
+            try:
+                combo.event_generate('<Down>')
+            except tk.TclError:
+                pass
+    combo.after_idle(_open)
+
+def bind_combobox_commit(combo: ttk.Combobox, commit):
+    def _commit_and_break(_event=None):
+        commit()
+        return 'break'
+    combo.bind('<<ComboboxSelected>>', _commit_and_break)
+    combo.bind('<Return>', _commit_and_break)
+    combo.bind('<Escape>', lambda _event: (combo.destroy(), 'break')[1])
+
+# 予算単位の解決（normalize_keyでlookup）
+def _resolve_budget_unit(node:FlatNode)->str:
+    key=normalize_key(node.assign_name).strip()
+    if key and key in distribution_master:
+        return distribution_master[key].get('予算単位(元)','') or node.budget_unit
+    return node.budget_unit
+
+# ---- 共通: 有効な「割り振り先」表示値（子がいるなら '分岐'） ----
+def get_display_assign_name(index: int) -> str:
+    node = flat_nodes[index]
+    an = normalize_value(node.assign_name).strip()
+    if has_child(index):
+        return '分岐'
+    return an
+
+# ---- 共通: 有効な「予算単位」表示値（末端のみ解決） ----
+def _resolve_budget_unit_effective(index: int) -> str:
+    node = flat_nodes[index]
+    if has_child(index):
+        return ''
+    return _resolve_budget_unit(node)
+
+# ---- 共通: 親行で割り振り先編集を抑止 ----
+ASSIGN_EDIT_BLOCK_MSG = "子ノードを持つため、この行の割り振り先は自動で『分岐』表示になります。\n編集は末端ノードで行ってください。"
+
+# 子ノード判定
+def has_child(index):
+    d=flat_nodes[index].depth
+    for j in range(index+1,len(flat_nodes)):
+        if flat_nodes[j].depth==d+1: return True
+        elif flat_nodes[j].depth<=d: break
+    return False
+
+# 管理列の算出
+def compute_management_values(index):
+    node=flat_nodes[index]
+    # 親子差大
+    children=[]; base=node.depth
+    for j in range(index+1,len(flat_nodes)):
+        c=flat_nodes[j]
+        if c.depth==base+1: children.append(c)
+        elif c.depth<=base: break
+    has_children=len(children)>0
+    no_anbun_child= not any(c.calc_method=='按分' for c in children)
+    child_total=sum(c.energy for c in children)
+    m_parent_child=''
+    if has_children and no_anbun_child and child_total!=0:
+        ratio=node.energy/child_total if child_total else 0
+        dev_pct=abs(ratio-1.0)*100.0
+        if dev_pct >= float(MGMT_CFG.get('parent_child_tolerance_percent', MGMT_CFG_DEFAULTS['parent_child_tolerance_percent'])):
+            m_parent_child=f"{ratio*100:.1f} %"
+    # 過大電力
+    m_over=''
+    at_num=extract_number(node.at,None)
+    if at_num is not None and at_num!=0:
+        max_e=float(at_num)*math.sqrt(3)*210/1000*24*30
+        th_frac=float(MGMT_CFG.get('over_power_threshold_percent_of_max', MGMT_CFG_DEFAULTS['over_power_threshold_percent_of_max']))/100.0
+        if node.energy > th_frac*max_e:
+            m_over=f"{(node.energy/max_e)*100:.1f} %"
+    # 負按分
+    m_neg=''; neg_th=float(MGMT_CFG.get('negative_anbun_threshold_kwh', MGMT_CFG_DEFAULTS['negative_anbun_threshold_kwh']))
+    if node.calc_method=='按分' and node.energy<=neg_th:
+        m_neg=format_energy_display(node.energy)
+    return m_parent_child, m_over, m_neg
+
+# 管理(呼出不可)：量・比率CSV / 割り振り先CSV の未解決を検出
+def get_call_unavailable_reasons(index:int)->List[str]:
+    node = flat_nodes[index]
+    mn_raw = normalize_value(node.measure_name).strip()
+    mn_key = normalize_key(node.measure_name).strip()
+    an_raw = normalize_value(node.assign_name).strip()
+    an_key = normalize_key(node.assign_name).strip()
+    is_branch = (an_raw == '分岐') and has_child(index)
+    reasons: List[str] = []
+
+    if node.calc_method == '実測':
+        if mn_raw == '':
+            reasons.append('実測ノードの計量名称が空です')
+        elif not measure_master:
+            reasons.append(f"実測値を取得できません（量・比率CSV未読込）: {mn_raw}")
+        elif mn_key not in measure_master:
+            reasons.append(f"実測値を取得できません（計量名称未登録）: {mn_raw}")
+    else:
+        if (mn_raw != '') and (mn_key not in measure_master):
+            reasons.append(f"計量名称未登録: {mn_raw}")
+
+    if (an_raw != '') and (not is_branch) and (an_key not in distribution_master):
+        reasons.append(f"割り振り先未登録: {an_raw}")
+
+    return reasons
+
+def compute_call_unavailable(index:int)->str:
+    return '呼出不可' if get_call_unavailable_reasons(index) else ''
+
+# ---- 自動幅調整 ----
+def _measure_text_width(font, text:str)->int: return font.measure(text if text is not None else '')
+
+def auto_size_tree_columns(tv:ttk.Treeview, cols:List[str], clamp_max:Dict[str,int]=None, numeric_cols:List[str]=None,
+                           sample_rows:int=SAMPLE_ROWS_FOR_MEASURE,
+                           node_name_width_persist:Optional[int]=None,
+                           measure_name_width_persist:Optional[int]=None,
+                           assign_name_width_persist:Optional[int]=None):
+    clamp_max = clamp_max or {}; numeric_cols = numeric_cols or []
+    f = tkfont.nametofont('TkDefaultFont')
+    if tv==tree:
+        header0='ノード名'; max_w0=_measure_text_width(f, header0)
+        for iid in tv.get_children(''): max_w0=max(max_w0, _measure_text_width(f, tv.item(iid,'text')))
+        measured0=max_w0+PADDING
+        width0=min(node_name_width_persist if (node_name_width_persist and node_name_width_persist>0) else measured0, MAX_NODE_NAME_WIDTH)
+        tv.column('#0', width=width0, stretch=False)
+    all_items = tv.get_children('')
+    items_to_check = all_items[:sample_rows] if sample_rows>0 and len(all_items)>sample_rows else all_items
+    for col in cols:
+        max_w=_measure_text_width(f,col)
+        for iid in items_to_check:
+            v=str(tv.set(iid,col)); max_w=max(max_w,_measure_text_width(f,v))
+        width=max_w+PADDING
+        if col=='計量名称' and (saved_measure_name_width and saved_measure_name_width>0): width = int(saved_measure_name_width)
+        if col=='割り振り先' and (saved_assign_name_width and saved_assign_name_width >0): width = int(saved_assign_name_width)
+        if col=='詳細２' and (saved_detail2_width and saved_detail2_width >0): width = int(saved_detail2_width)
+        if col in clamp_max: width=min(width, clamp_max[col])
+        if col in numeric_cols: tv.column(col, width=width, stretch=False, anchor='e')
+        else: tv.column(col, width=width, stretch=False)
+
+# ---- 描画 ----
+
+def draw_tree():
+    apply_masters_from_csv(); calculate_energy()
+    tree.delete(*tree.get_children('')); node_ids.clear()
+    parent_stack=[]; table_row_no=1
+    for i,node in enumerate(flat_nodes):
+        disp_assign = get_display_assign_name(i)
+        while parent_stack and flat_nodes[parent_stack[-1]].depth>=node.depth: parent_stack.pop()
+        parent_id = node_ids[parent_stack[-1]] if parent_stack else ''
+        budget_unit=_resolve_budget_unit_effective(i)
+        ratio_str=f"{float(node.ratio):.1f}" if node.calc_method=='按分' else ''
+        unit_str=node.unit if node.calc_method=='按分' else ''
+        energy_str=format_energy_display(node.energy)
+        m1,m2,m3=compute_management_values(i)
+        m4=compute_call_unavailable(i)
+        disp_method = get_display_method(i)
+        nid=tree.insert(parent_id,'end', text=node.name, values=(
+            node.detail1,node.detail2,table_row_no,method_with_icon(disp_method),format_at_display(node.at),node.measure_name,ratio_str,unit_str,energy_str,disp_assign,budget_unit,node.electric_room,node.transformer,notes_with_icon(node.notes),node.category1,node.category2,node.category3,m1,m2,m3,m4
+        ), tags=(f"depth{node.depth}",))
+        tree.item(nid, open=depth_open_state.get(node.depth, True))
+        node_ids[i]=nid; parent_stack.append(i); table_row_no+=1
+    for d in range(MAX_DEPTH+1):
+        tree.tag_configure(f'depth{d}', background=_depth_color(d))
+    auto_size_tree_columns(
+        tree, list(columns),
+        clamp_max={'割り振り先':MAX_ASSIGN_NAME_WIDTH, '計量名称':MAX_MEASURE_NAME_WIDTH, '詳細２':MAX_DETAIL2_WIDTH},
+        numeric_cols=['行番号','按分比率','電力量','管理(親子差大)','管理(過大電力)','管理(負按分)'],
+        sample_rows=SAMPLE_ROWS_FOR_MEASURE,
+        node_name_width_persist=saved_node_name_width,
+        measure_name_width_persist=saved_measure_name_width,
+        assign_name_width_persist=saved_assign_name_width
+    )
+
+# ---- Undo/Redo ----
+history_stack: List[List[FlatNode]]=[]; redo_stack: List[List[FlatNode]]=[]
+
+def push_history(): history_stack.append(copy.deepcopy(flat_nodes)); redo_stack.clear()
+
+def undo():
+    if not history_stack: return
+    redo_stack.append(copy.deepcopy(flat_nodes)); prev=history_stack.pop()
+    flat_nodes.clear(); flat_nodes.extend(prev)
+    redraw_preserving_state()
+
+def redo():
+    if not redo_stack: return
+    history_stack.append(copy.deepcopy(flat_nodes)); nxt=redo_stack.pop()
+    flat_nodes.clear(); flat_nodes.extend(nxt)
+    redraw_preserving_state()
+
+# ---- 状態保存/復元（選択・スクロール・開閉） ----
+
+def _snapshot_tree_state():
+    sel = tree.selection()
+    selected_index = None
+    if sel:
+        try:
+            selected_index = list(node_ids.values()).index(sel[0])
+        except ValueError:
+            selected_index = None
+    y0, y1 = tree.yview()
+    open_state_by_index = {}
+    for idx, iid in node_ids.items():
+        try:
+            open_state_by_index[idx] = bool(tree.item(iid, 'open'))
+        except Exception:
+            pass
+    return {'selected_index': selected_index, 'yview': (y0, y1), 'open': open_state_by_index}
+
+
+def _restore_tree_state(state):
+    if not state: return
+    open_map = state.get('open', {})
+    for idx, iid in node_ids.items():
+        if idx in open_map:
+            try:
+                tree.item(iid, open=open_map[idx])
+            except Exception:
+                pass
+    y0, y1 = state.get('yview', (None, None))
+    if y0 is not None:
+        try:
+            tree.yview_moveto(y0)
+        except Exception:
+            pass
+    sel_idx = state.get('selected_index', None)
+    if sel_idx is not None and sel_idx in node_ids:
+        iid = node_ids[sel_idx]
+        tree.selection_set(iid); tree.focus(iid); tree.see(iid); tree.focus_set()
+
+def redraw_preserving_state(state=None):
+    if state is None:
+        state = _snapshot_tree_state()
+    draw_tree()
+    _restore_tree_state(state)
+
+def update_node_and_redraw(index:int, updater, preserve_state:bool=True):
+    state = _snapshot_tree_state() if preserve_state else None
+    push_history()
+    updater(flat_nodes[index])
+    redraw_preserving_state(state)
+
+# ---- 1行軽量更新 ----
+
+def refresh_row(index: int):
+    if index not in node_ids: return
+    node = flat_nodes[index]
+    iid = node_ids[index]
+    disp_assign = get_display_assign_name(index)
+    budget_unit = _resolve_budget_unit_effective(index)
+    ratio_str = f"{float(node.ratio):.1f}" if node.calc_method == '按分' else ''
+    unit_str = node.unit if node.calc_method == '按分' else ''
+    energy_str = format_energy_display(node.energy)
+    m1, m2, m3 = compute_management_values(index)
+    m4 = compute_call_unavailable(index)
+    disp_method = get_display_method(index)
+    tree.item(iid, text=node.name)
+    tree.set(iid, '詳細１', node.detail1)
+    tree.set(iid, '詳細２', node.detail2)
+    tree.set(iid, '算出方法', method_with_icon(disp_method))
+    tree.set(iid, 'AT', format_at_display(node.at))
+    tree.set(iid, '計量名称', node.measure_name)
+    tree.set(iid, '按分比率', ratio_str)
+    tree.set(iid, '按分単位', unit_str)
+    tree.set(iid, '電力量', energy_str)
+    tree.set(iid, '割り振り先', disp_assign)
+    tree.set(iid, '予算単位', budget_unit)
+    tree.set(iid, '電気室', node.electric_room)
+    tree.set(iid, '変圧器', node.transformer)
+    tree.set(iid, '備考', notes_with_icon(node.notes))
+    tree.set(iid, '分類１', getattr(node, 'category1',''))
+    tree.set(iid, '分類２', getattr(node, 'category2',''))
+    tree.set(iid, '分類３', getattr(node, 'category3',''))
+    tree.set(iid, '管理(親子差大)', m1)
+    tree.set(iid, '管理(過大電力)', m2)
+    tree.set(iid, '管理(負按分)', m3)
+    tree.set(iid, '管理(呼出不可)', m4)
+
+# ---- 編集（ダブルクリック） ----
+
+def on_double_click(event):
+    global saved_measure_name_width, saved_assign_name_width, saved_detail2_width
+    item = tree.identify_row(event.y)
+    column = tree.identify_column(event.x)
+    if not item:
+        return None
+    index = list(node_ids.values()).index(item)
+    node = flat_nodes[index]
+
+    if column == '#0':
+        x, y, w, h = tree.bbox(item, column)
+        e = tk.Entry(tree)
+        e.place(x=x, y=y, width=w, height=h)
+        e.insert(0, node.name)
+        def commit():
+            push_history()
+            node.name = e.get()
+            e.destroy()
+            refresh_row(index)
+        e.bind('<Return>', lambda _: commit())
+        e.bind('<FocusOut>', lambda _: commit())
+        e.focus()
+        return 'break'
+
+    col_index = int(column.replace('#', '')) - 1
+    col_name = columns[col_index]
+    attr = column_attr_map.get(col_name)
+    x, y, w, h = tree.bbox(item, column)
+
+    if col_name == '詳細２':
+        try:
+            saved_detail2_width = int(tree.column('詳細２', 'width'))
+        except Exception:
+            pass
+
+    if col_name in ['行番号','電力量','予算単位','管理(親子差大)','管理(過大電力)','管理(負按分)','管理(呼出不可)']:
+        return 'break'
+    if (col_name in ['按分比率','按分単位']) and node.calc_method != '按分':
+        return 'break'
+
+    if col_name == '算出方法':
+        combo = ttk.Combobox(tree, values=list(CALC_METHOD_CHOICES), state='readonly')
+        combo.place(x=x, y=y, width=w, height=h)
+        combo.set(node.calc_method)
+        def commit():
+            new = sanitize_calc_method(combo.get())
+            if new == node.calc_method:
+                combo.destroy()
+                return
+            def updater(current: FlatNode):
+                current.calc_method = new
+                apply_measure_master_to_node(current)
+            combo.destroy()
+            update_node_and_redraw(index, updater)
+        bind_combobox_commit(combo, commit)
+        open_combobox_dropdown(combo)
+        return 'break'
+
+    elif col_name == 'AT':
+        e = tk.Entry(tree)
+        e.place(x=x, y=y, width=w, height=h)
+        e.insert(0, format_at_display(node.at))
+        def commit():
+            push_history()
+            num = extract_number(e.get(), None)
+            node.at = str(int(round(num))) if num is not None else e.get()
+            e.destroy()
+            refresh_row(index)
+        e.bind('<Return>', lambda _: commit())
+        e.bind('<FocusOut>', lambda _: commit())
+        e.focus()
+        return 'break'
+
+    elif col_name == '計量名称':
+        try:
+            saved_measure_name_width = int(tree.column('計量名称', 'width'))
+        except Exception:
+            pass
+        cand = sorted(measure_master.keys()) if measure_master else sorted(measure_name_options)
+        combo = ttk.Combobox(tree, values=cand)
+        combo.place(x=x, y=y, width=w, height=h)
+        combo.set(normalize_key(node.measure_name))
+        def commit():
+            raw = normalize_value(combo.get())
+            if raw == node.measure_name:
+                combo.destroy()
+                return
+            def updater(current: FlatNode):
+                current.measure_name = raw
+                apply_measure_master_to_node(current)
+            combo.destroy()
+            update_node_and_redraw(index, updater)
+        bind_combobox_commit(combo, commit)
+        combo.focus()
+        return 'break'
+
+    elif col_name == '割り振り先':
+        try:
+            saved_assign_name_width = int(tree.column('割り振り先', 'width'))
+        except Exception:
+            pass
+        if has_child(index):
+            messagebox.showinfo('割り振り先', ASSIGN_EDIT_BLOCK_MSG)
+            return 'break'
+        cand = sorted(distribution_master.keys()) if distribution_master else []
+        combo = ttk.Combobox(tree, values=cand)
+        combo.place(x=x, y=y, width=w, height=h)
+        combo.set(normalize_key(node.assign_name))
+        def commit():
+            push_history()
+            raw = normalize_value(combo.get())
+            node.assign_name = raw
+            combo.destroy()
+            refresh_row(index)
+        bind_combobox_commit(combo, commit)
+        combo.focus()
+        return 'break'
+
+    else:
+        e = tk.Entry(tree)
+        e.place(x=x, y=y, width=w, height=h)
+        e.insert(0, str(getattr(node, attr)))
+        def commit():
+            try:
+                val = e.get()
+                if attr in ['ratio','energy']:
+                    numeric = float(val)
+                    e.destroy()
+                    if getattr(node, attr) == numeric:
+                        return
+                    def updater(current: FlatNode):
+                        setattr(current, attr, numeric)
+                    update_node_and_redraw(index, updater)
+                    return
+                else:
+                    if getattr(node, attr) != val:
+                        push_history()
+                        setattr(node, attr, val)
+            except ValueError:
+                pass
+            e.destroy()
+            refresh_row(index)
+        e.bind('<Return>', lambda _: commit())
+        e.bind('<FocusOut>', lambda _: commit())
+        e.focus()
+        return 'break'
+
+tree.bind('<Double-1>', on_double_click)
+
+# === 列幅の手動リサイズを即時保存 ===
+_last_widths = {'#0': None, '計量名称': None, '割り振り先': None, '詳細２': None}
+
+def _snapshot_widths():
+    try:
+        _last_widths['#0'] = int(tree.column('#0','width'))
+        _last_widths['計量名称'] = int(tree.column('計量名称','width'))
+        _last_widths['割り振り先']= int(tree.column('割り振り先','width'))
+        _last_widths['詳細２'] = int(tree.column('詳細２','width'))
+    except Exception:
+        pass
+
+def _maybe_save_resized_columns(event=None):
+    global saved_node_name_width, saved_measure_name_width, saved_assign_name_width, saved_detail2_width
+    changed = False
+    try:
+        w0 = int(tree.column('#0','width'))
+        w1 = int(tree.column('計量名称','width'))
+        w2 = int(tree.column('割り振り先','width'))
+        w3 = int(tree.column('詳細２','width'))
+    except Exception:
+        return
+    if _last_widths.get('#0') != w0: saved_node_name_width = min(w0, MAX_NODE_NAME_WIDTH); changed = True
+    if _last_widths.get('計量名称') != w1: saved_measure_name_width = min(w1, MAX_MEASURE_NAME_WIDTH); changed = True
+    if _last_widths.get('割り振り先')!= w2: saved_assign_name_width = min(w2, MAX_ASSIGN_NAME_WIDTH); changed = True
+    if _last_widths.get('詳細２') != w3: saved_detail2_width = min(w3, MAX_DETAIL2_WIDTH); changed = True
+    _snapshot_widths()
+    if changed:
+        try: save_config()
+        except Exception: pass
+
+# イベント
+tree.bind('<ButtonRelease-1>', _maybe_save_resized_columns)
+root.bind('<Configure>', lambda e: _snapshot_widths())
+
+# ---- 管理行ウィンドウ ----
+def show_management_rows_window():
+    top=tk.Toplevel(root); top.title('管理行（管理列に該当する行番号と理由＋内容）'); top.geometry('620x600')
+    frame=ttk.Frame(top); frame.pack(fill='both', expand=True)
+    tv=ttk.Treeview(frame, show='headings')
+    vsb=ttk.Scrollbar(frame, orient='vertical', command=tv.yview)
+    hsb=ttk.Scrollbar(frame, orient='horizontal', command=tv.xview)
+    tv.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+    cols=('行番号','理由','内容'); tv['columns']=cols
+    for c in cols: tv.heading(c, text=c)
+    tv.grid(row=0,column=0,sticky='nsew'); vsb.grid(row=0,column=1,sticky='ns'); hsb.grid(row=1,column=0,sticky='ew')
+    frame.rowconfigure(0,weight=1); frame.columnconfigure(0,weight=1)
+    def refresh():
+        tv.delete(*tv.get_children(''))
+        for row_no,_ in enumerate(flat_nodes, start=1):
+            idx=row_no-1
+            m1,m2,m3=compute_management_values(idx)
+            call_reasons = get_call_unavailable_reasons(idx)
+            reasons=[]; contents=[]
+            if m1: reasons.append('親子差大')
+            if m2: reasons.append('過大電力')
+            if m3: reasons.append('負按分')
+            if call_reasons:
+                reasons.append('呼出不可')
+                contents.extend(call_reasons)
+            if reasons:
+                tv.insert('', 'end', values=(row_no, '／'.join(reasons), ' ／ '.join(contents)))
+        auto_size_tree_columns(tv, list(cols), clamp_max={}, numeric_cols=['行番号'], sample_rows=SAMPLE_ROWS_FOR_MEASURE)
+    def jump():
+        sel=tv.selection()
+        if not sel: return
+        vals=tv.item(sel[0],'values')
+        if not vals: return
+        try: idx=int(vals[0])-1
+        except (TypeError, ValueError): return
+        if idx in node_ids:
+            iid=node_ids[idx]
+            tree.selection_set(iid); tree.focus(iid); tree.see(iid); tree.focus_set()
+    refresh(); btn=ttk.Frame(top); btn.pack(fill='x', padx=8, pady=8)
+    ttk.Button(btn, text='更新', command=refresh).pack(side='right')
+    ttk.Button(btn, text='ジャンプ', command=jump).pack(side='right', padx=(0,8))
+    tv.bind('<Double-1>', lambda e: jump())
+
+# ---- 量・比率CSV 読み込み（マスタ表示＋参照回数） ----
+def _get_first(d:Dict[str,Any], keys:List[str])->str:
+    for k in keys:
+        if k in d and d[k] not in (None,''):
+            return str(d[k])
+    return ''
+
+def _count_measure_calls_in_table():
+    cnt={}
+    for n in flat_nodes:
+        key=normalize_key(n.measure_name)
+        if not key: continue
+        cnt[key]=cnt.get(key,0)+1
+    return cnt
+
+def _count_assignname_calls_in_table():
+    cnt={}
+    for n in flat_nodes:
+        key=normalize_key(n.assign_name)
+        if not key: continue
+        cnt[key]=cnt.get(key,0)+1
+    return cnt
+
+def load_measure_master_csv():
+    global measure_master
+    paths=filedialog.askopenfilenames(filetypes=[('CSVファイル','*.csv')], title='量・比率CSVを選択')
+    if not paths: return
+    measure_master.clear(); total=0
+    for p in paths:
+        rows=read_csv_dicts_with_fallback(p)
+        for r in rows:
+            name=_get_first(r,['計量名称(元)','計量名称']).strip()
+            if not name: continue
+            qty=_get_first(r,['量・比率(元)','量・比率','量'])
+            unit=_get_first(r,['単位(元)','単位']).strip()
+            try:
+                qv=float(qty) if qty!='' else 0.0
+            except (TypeError, ValueError):
+                qv=0.0
+            measure_master[normalize_key(name)]={'量・比率(元)': qv, '単位(元)': unit}
+            total+=1
+    print('[量・比率] 取り込み件数:', total, '/ 一意キー数:', len(measure_master))
+    # 重複キーの検出（normalize_key後のキーで評価）
+    norm_map = {}
+    for k in measure_master.keys():
+        nk = normalize_key(k).lower()
+        norm_map.setdefault(nk, []).append(k)
+    dup_keys = {nk for nk, lst in norm_map.items() if len(lst) > 1}
+    # ビュー
+    top=tk.Toplevel(root); top.title('量・比率CSV（マスタ表示＋参照回数）'); top.geometry('920x520')
+    frame=ttk.Frame(top); frame.pack(fill='both', expand=True)
+    tv=ttk.Treeview(frame, show='headings'); vsb=ttk.Scrollbar(frame, orient='vertical', command=tv.yview); hsb=ttk.Scrollbar(frame, orient='horizontal', command=tv.xview)
+    tv.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+    cols=('計量名称(元)','量・比率(元)','単位(元)','参照回数'); tv['columns']=cols
+    for c in cols: tv.heading(c, text=c)
+    tv.grid(row=0,column=0,sticky='nsew'); vsb.grid(row=0,column=1,sticky='ns'); hsb.grid(row=1,column=0,sticky='ew')
+    frame.rowconfigure(0,weight=1); frame.columnconfigure(0,weight=1)
+    tv.tag_configure('dup', background='#ffe6e6')
+    def refresh():
+        tv.delete(*tv.get_children(''))
+        calls=_count_measure_calls_in_table()
+        for k,v in sorted(measure_master.items()):
+            tags=('dup',) if normalize_key(k).lower() in dup_keys else ()
+            tv.insert('', 'end', values=(k, v['量・比率(元)'], v['単位(元)'], calls.get(normalize_key(k),0)), tags=tags)
+        auto_size_tree_columns(tv, list(cols), clamp_max={}, numeric_cols=['量・比率(元)','参照回数'], sample_rows=SAMPLE_ROWS_FOR_MEASURE)
+    refresh()
+    ttk.Button(top, text='更新', command=refresh).pack(anchor='e', padx=8, pady=8)
+
+# ---- 割り振り先CSV 読み込み（マスタ表示＋参照回数） ----
+def load_distribution_master_csv():
+    global distribution_master
+    paths=filedialog.askopenfilenames(filetypes=[('CSVファイル','*.csv')], title='割り振り先CSVを選択')
+    if not paths: return
+    distribution_master.clear(); total=0
+    for p in paths:
+        rows=read_csv_dicts_with_fallback(p)
+        for r in rows:
+            key=(r.get('割り振り先(元)','') or r.get('割り振り先','') or '').strip()
+            if not key: continue
+            distribution_master[normalize_key(key)]={'予算単位(元)': (r.get('予算単位(元)','') or r.get('予算単位','') or '').strip()}
+            total+=1
+    print('[割り振り先] 取り込み件数:', total, '/ 一意キー数:', len(distribution_master))
+    # 重複キー検出（normalize_key後のキーで評価）
+    norm_map = {}
+    for k in distribution_master.keys():
+        nk = normalize_key(k).lower()
+        norm_map.setdefault(nk, []).append(k)
+    dup_keys = {nk for nk, lst in norm_map.items() if len(lst) > 1}
+    # ビュー
+    top=tk.Toplevel(root); top.title('割り振り先CSV（マスタ表示＋参照回数）'); top.geometry('900x520')
+    frame=ttk.Frame(top); frame.pack(fill='both', expand=True)
+    tv=ttk.Treeview(frame, show='headings'); vsb=ttk.Scrollbar(frame, orient='vertical', command=tv.yview); hsb=ttk.Scrollbar(frame, orient='horizontal', command=tv.xview)
+    tv.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+    cols=('割り振り先(元)','予算単位(元)','参照回数'); tv['columns']=cols
+    for c in cols: tv.heading(c, text=c)
+    tv.grid(row=0,column=0,sticky='nsew'); vsb.grid(row=0,column=1,sticky='ns'); hsb.grid(row=1,column=0,sticky='ew')
+    frame.rowconfigure(0,weight=1); frame.columnconfigure(0,weight=1)
+    tv.tag_configure('dup', background='#ffe6e6')
+    def refresh():
+        tv.delete(*tv.get_children(''))
+        calls=_count_assignname_calls_in_table()
+        for k in sorted(distribution_master.keys()):
+            tags=('dup',) if normalize_key(k).lower() in dup_keys else ()
+            tv.insert('', 'end', values=(k, distribution_master[k]['予算単位(元)'], calls.get(normalize_key(k),0)), tags=tags)
+        auto_size_tree_columns(tv, list(cols), clamp_max={}, numeric_cols=['参照回数'], sample_rows=SAMPLE_ROWS_FOR_MEASURE)
+    refresh()
+    ttk.Button(top, text='更新', command=refresh).pack(anchor='e', padx=8, pady=8)
+
+# === 予算単位候補の収集（末端のみ） ===
+def _collect_all_units_for_combo():
+    all_units = set()
+    for i in range(len(flat_nodes)):
+        u = _resolve_budget_unit_effective(i)
+        if u:
+            all_units.add(u)
+    return sorted(all_units)
+
+# ---- 分析ビュー ----
+def show_analysis_view():
+    base=[]
+    for idx,n in enumerate(flat_nodes, start=1):
+        i0 = idx - 1
+        assign = get_display_assign_name(i0)
+        disp_method = get_display_method(idx-1)
+        base.append({
+            '予算単位': _resolve_budget_unit(n),
+            '割り振り先': assign,
+            TREE_ROW_LABEL: idx,
+            'ノード名': n.name,
+            '詳細１': n.detail1,
+            '詳細２': n.detail2,
+            '算出方法': disp_method,
+            '電力量': float(round(n.energy,2)),
+            '電気室': n.electric_room,
+            '変圧器': n.transformer,
+            '備考': n.notes,
+            '分類１': getattr(n,'category1',''),
+            '分類２': getattr(n,'category2',''),
+            '分類３': getattr(n,'category3','')
+        })
+    top=tk.Toplevel(root); top.title('分析ビュー'); top.geometry('1600x820')
+    cols=('予算単位','割り振り先',TREE_ROW_LABEL,'ノード名','詳細１','詳細２','算出方法','電力量','電気室','変圧器','備考','分類１','分類２','分類３')
+    tree_frame = ttk.Frame(top); tree_frame.pack(fill='both', expand=True)
+    tv=ttk.Treeview(tree_frame, show='headings'); vsb=ttk.Scrollbar(tree_frame, orient='vertical', command=tv.yview); hsb=ttk.Scrollbar(tree_frame, orient='horizontal', command=tv.xview)
+    tv.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+    tv['columns']=cols
+    for h in cols: tv.heading(h, text=h)
+    tv.grid(row=0,column=0,sticky='nsew'); vsb.grid(row=0,column=1,sticky='ns'); hsb.grid(row=1,column=0,sticky='ew')
+    tree_frame.rowconfigure(0,weight=1); tree_frame.columnconfigure(0,weight=1)
+    ctrl=ttk.Frame(top); ctrl.pack(fill='x', padx=8, pady=6)
+    units = sorted(set(r['予算単位'] for r in base if r['予算単位']))
+    assigns= sorted(set(r['割り振り先'] for r in base if r['割り振り先']))
+    methods=list(DISPLAY_METHOD_CHOICES)
+    cats1 = sorted(set(r['分類１'] for r in base if r['分類１']))
+    cats2 = sorted(set(r['分類２'] for r in base if r['分類２']))
+    cats3 = sorted(set(r['分類３'] for r in base if r['分類３']))
+    ttk.Label(ctrl,text='予算単位').grid(row=0,column=0,sticky='w'); cb_unit=ttk.Combobox(ctrl, values=['']+units, width=18); cb_unit.grid(row=0,column=1,padx=6)
+    ttk.Label(ctrl,text='割り振り先').grid(row=0,column=2,sticky='w'); cb_assign=ttk.Combobox(ctrl, values=['']+assigns, width=24); cb_assign.grid(row=0,column=3,padx=6)
+    ttk.Label(ctrl,text='算出方法').grid(row=0,column=4,sticky='w'); cb_method=ttk.Combobox(ctrl, values=methods, width=12); cb_method.grid(row=0,column=5,padx=6)
+    ttk.Label(ctrl,text='電力量 範囲').grid(row=0,column=6,sticky='w'); en_min=ttk.Entry(ctrl,width=10); en_min.grid(row=0,column=7,padx=4); ttk.Label(ctrl,text='～').grid(row=0,column=8); en_max=ttk.Entry(ctrl,width=10); en_max.grid(row=0,column=9,padx=4)
+    show_branch_var = tk.BooleanVar(value=False)
+    chk_branch = ttk.Checkbutton(ctrl, text='分岐表示', variable=show_branch_var)
+    chk_branch.grid(row=0,column=10, padx=8, sticky='w')
+    ttk.Label(ctrl,text='分類１').grid(row=1,column=0,sticky='w'); cb_cat1=ttk.Combobox(ctrl, values=['']+cats1, width=18); cb_cat1.grid(row=1,column=1,padx=6)
+    ttk.Label(ctrl,text='分類２').grid(row=1,column=2,sticky='w'); cb_cat2=ttk.Combobox(ctrl, values=['']+cats2, width=18); cb_cat2.grid(row=1,column=3,padx=6)
+    ttk.Label(ctrl,text='分類３').grid(row=1,column=4,sticky='w'); cb_cat3=ttk.Combobox(ctrl, values=['']+cats3, width=18); cb_cat3.grid(row=1,column=5,padx=6)
+    btn_jump = ttk.Button(ctrl, text='ジャンプ')
+    btn_csv = ttk.Button(ctrl, text='CSV出力')
+    btn_apply= ttk.Button(ctrl, text='適用')
+    btn_clear= ttk.Button(ctrl, text='クリア')
+    btn_jump.grid(row=0,column=11, padx=8, sticky='e')
+    btn_csv.grid(row=0,column=12, padx=(0,8), sticky='e')
+    btn_apply.grid(row=1,column=11, padx=8, sticky='e')
+    btn_clear.grid(row=1,column=12, padx=(0,8), sticky='e')
+
+    sort_state={c:'none' for c in cols}
+    def _col_key(c,r): return float(r[c]) if c in ('電力量',TREE_ROW_LABEL) else r[c]
+    def get_filtered_rows():
+        u=cb_unit.get().strip(); a=cb_assign.get().strip(); m=cb_method.get().strip(); k1=cb_cat1.get().strip(); k2=cb_cat2.get().strip(); k3=cb_cat3.get().strip()
+        def _num(s):
+            try: return float(s.strip()) if s.strip()!='' else None
+            except ValueError: return None
+        mn=_num(en_min.get()); mx=_num(en_max.get())
+        include_branch = show_branch_var.get()
+        out=[]
+        for r in base:
+            if (not include_branch) and r['割り振り先']=='分岐': continue
+            if u and r['予算単位']!=u: continue
+            if a and r['割り振り先']!=a: continue
+            if m and r['算出方法']!=m: continue
+            if k1 and r['分類１']!=k1: continue
+            if k2 and r['分類２']!=k2: continue
+            if k3 and r['分類３']!=k3: continue
+            v=float(r['電力量'])
+            if (mn is not None and v<mn) or (mx is not None and v>mx): continue
+            out.append(r)
+        return out
+    def apply_sort(rows,column):
+        st=sort_state[column]
+        if st=='none': sort_state[column]='asc'; rows.sort(key=lambda r:_col_key(column,r))
+        elif st=='asc': sort_state[column]='desc'; rows.sort(key=lambda r:_col_key(column,r), reverse=True)
+        else: sort_state[column]='none'; rows[:]=get_filtered_rows()
+        return rows
+    def on_heading_click(column):
+        rows=get_filtered_rows(); rows=apply_sort(rows,column); fill(rows)
+        for c in cols: tv.heading(c, text=c, command=lambda cc=c: on_heading_click(cc))
+    def fill(rows):
+        tv.delete(*tv.get_children('')); total=0.0
+        for r in rows:
+            total += float(r['電力量'])
+            tv.insert('', 'end', values=(r['予算単位'], r['割り振り先'], r[TREE_ROW_LABEL],
+                                         r['ノード名'], r['詳細１'], r['詳細２'], r['算出方法'],
+                                         format_energy_display(r['電力量']), r['電気室'], r['変圧器'],
+                                         r['備考'], r['分類１'], r['分類２'], r['分類３']))
+        auto_size_tree_columns(tv, list(cols), clamp_max={'割り振り先': MAX_ASSIGN_NAME_WIDTH, 'ノード名': MAX_NODE_NAME_WIDTH}, numeric_cols=[TREE_ROW_LABEL, '電力量'], sample_rows=SAMPLE_ROWS_FOR_MEASURE)
+    def apply_filters():
+        rows=get_filtered_rows(); act=[c for c,st in sort_state.items() if st in ('asc','desc')]
+        if act:
+            col=act[-1]; rev=sort_state[col]=='desc'; rows.sort(key=lambda r:_col_key(col,r), reverse=rev)
+        fill(rows)
+    def clear_filters():
+        for w in (cb_unit,cb_assign,cb_method,cb_cat1,cb_cat2,cb_cat3): w.set('')
+        en_min.delete(0,tk.END); en_max.delete(0,tk.END)
+        show_branch_var.set(False)
+        for c in cols: sort_state[c]='none'
+        fill(get_filtered_rows())
+    def _get_selected_row_index():
+        sel = tv.selection()
+        if not sel: return None
+        vals = tv.item(sel[0], 'values')
+        if not vals or len(vals) < 3: return None
+        try: return int(vals[2])
+        except Exception: return None
+    def jump_from_analysis():
+        idx1 = _get_selected_row_index()
+        if idx1 is None: return
+        idx0 = idx1 - 1
+        if idx0 in node_ids:
+            iid = node_ids[idx0]
+            tree.selection_set(iid); tree.focus(iid); tree.see(iid); tree.focus_set()
+    def export_csv():
+        rows=get_filtered_rows(); act=[c for c,st in sort_state.items() if st in ('asc','desc')]
+        if act:
+            col=act[-1]; rev=sort_state[col]=='desc'; rows.sort(key=lambda r:_col_key(col,r), reverse=rev)
+        path=filedialog.asksaveasfilename(defaultextension='.csv',filetypes=[('CSVファイル','*.csv')],title='分析ビューをCSV出力')
+        if not path: return
+        headers=list(cols)
+        with open(path,'w',encoding='utf-8-sig',newline='') as f:
+            w=csv.writer(f); w.writerow(headers)
+            total=0.0
+            for r in rows:
+                total+=float(r['電力量'])
+                _t=excel_safe_text
+                w.writerow([_t(r['予算単位']),_t(r['割り振り先']),r[TREE_ROW_LABEL],_t(r['ノード名']),_t(r['詳細１']),_t(r['詳細２']),_t(r['算出方法']),f"{float(r['電力量']):.1f}",_t(r['電気室']),_t(r['変圧器']),_t(r['備考']),_t(r['分類１']),_t(r['分類２']),_t(r['分類３'])])
+    for c in cols: tv.heading(c, command=lambda cc=c: on_heading_click(cc))
+    btn_apply.configure(command=apply_filters)
+    btn_clear.configure(command=clear_filters)
+    btn_jump.configure(command=jump_from_analysis)
+    btn_csv.configure(command=export_csv)
+    tv.bind('<Double-1>', lambda e: jump_from_analysis())
+    fill(get_filtered_rows())
+
+# ---- 並べ替え/階層/追加削除 ----
+
+def move_node(up=True):
+    sel = tree.selection()
+    if not sel: return
+    index=list(node_ids.values()).index(sel[0])
+    state = _snapshot_tree_state()
+    push_history()
+    if move_subtree(index, up):
+        redraw_preserving_state(state)
+    else:
+        history_stack.pop()
+
+def change_depth(increase=True):
+    sel = tree.selection()
+    if not sel: return
+    index=list(node_ids.values()).index(sel[0])
+    state = _snapshot_tree_state()
+    push_history()
+    if change_subtree_depth(index, increase):
+        redraw_preserving_state(state)
+    else:
+        history_stack.pop()
+
+def add_node():
+    sel=tree.selection()
+    idx = list(node_ids.values()).index(sel[0]) if sel else None
+    state = _snapshot_tree_state()
+    push_history()
+    pos = insert_node_after_selection(idx)
+    state['selected_index'] = pos
+    redraw_preserving_state(state)
+
+def delete_node():
+    sel = tree.selection()
+    if not sel: return
+    idx=list(node_ids.values()).index(sel[0])
+    count=get_subtree_end_index(idx)-idx
+    res=messagebox.askyesnocancel('削除の確認', f'選択ノードと配下 {count} 件を削除します。よろしいですか？\n\n［はい］：削除 / ［いいえ］：中止 / ［キャンセル］：何もしない')
+    if res is True:
+        state = _snapshot_tree_state()
+        push_history()
+        delete_subtree(idx)
+        if idx >= len(flat_nodes):
+            state['selected_index'] = len(flat_nodes) - 1 if flat_nodes else None
+        redraw_preserving_state(state)
+
+# ---- CSV 読み込み/出力（ツリー） ----
+
+def load_from_csv():
+    global measure_name_options
+    p=filedialog.askopenfilename(filetypes=[('CSVファイル','*.csv')], title='ツリーCSVを選択')
+    if not p: return
+    try:
+        rows=read_csv_dicts_with_fallback(p)
+        flat_nodes.clear(); measure_name_options.clear()
+        for row in rows:
+            measure_name=normalize_value(row.get('計量名称','') or row.get('measure_name',''))
+            if measure_name: measure_name_options.add(measure_name)
+            assign=normalize_value(row.get('割り振り先','') or row.get('assign_name',''))
+            budget=normalize_value(row.get('予算単位','') or row.get('budget_unit',''))
+            flat_nodes.append(FlatNode(
+                name=row.get('ノード名','') or row.get('name',''),
+                calc_method=sanitize_calc_method(row.get('算出方法','') or row.get('calc_method','按分')),
+                at=normalize_value(row.get('AT','') or row.get('at','')),
+                measure_name=measure_name,
+                ratio=row.get('按分比率','') or row.get('ratio',''),
+                unit=normalize_value(row.get('按分単位','') or row.get('unit','')),
+                # ツリーCSVの電力量は入力値として使わず、毎回再計算する。
+                energy=0.0,
+                depth=int(row.get('階層', row.get('depth',0)) or 0),
+                assign_name=assign,
+                budget_unit=budget,
+                electric_room=normalize_value(row.get('電気室','') or row.get('electric_room','')),
+                transformer=normalize_value(row.get('変圧器','') or row.get('transformer','')),
+                notes=normalize_value(row.get('備考','') or row.get('notes','')),
+                detail1=normalize_value(row.get('詳細１','') or row.get('detail1','')),
+                detail2=normalize_value(row.get('詳細２','') or row.get('detail2','')),
+                category1=normalize_value(row.get('分類１','') or row.get('category1','')),
+                category2=normalize_value(row.get('分類２','') or row.get('category2','')),
+                category3=normalize_value(row.get('分類３','') or row.get('category3','')),
+            ))
+        state=_snapshot_tree_state(); draw_tree(); _restore_tree_state(state)
+    except Exception as e:
+        print('読み込みエラー:', e)
+
+
+def export_to_csv():
+    path = filedialog.asksaveasfilename(defaultextension='.csv', filetypes=[('CSVファイル','*.csv')], title='ツリーCSVの保存先を選択')
+    if not path: return
+    headers=['ノード名','詳細１','詳細２','行番号','算出方法','AT','計量名称','按分比率','按分単位','電力量','割り振り先','予算単位','電気室','変圧器','備考','分類１','分類２','分類３','管理(親子差大)','管理(過大電力)','管理(負按分)','管理(呼出不可)','階層']
+    try:
+        with open(path,'w',encoding='utf-8-sig',newline='') as f:
+            w = csv.writer(f)
+            w.writerow(headers)
+            for i, n in enumerate(flat_nodes):
+                idx = i + 1
+                m1, m2, m3 = compute_management_values(i)
+                disp_method = get_display_method(i)
+                m4 = compute_call_unavailable(i)
+                disp_assign = get_display_assign_name(i)
+                budget_unit = _resolve_budget_unit_effective(i)
+                w.writerow([
+                    n.name,
+                    n.detail1,
+                    n.detail2,
+                    idx,
+                    disp_method,
+                    format_at_display(n.at),
+                    n.measure_name,
+                    n.ratio,
+                    n.unit,
+                    n.energy,
+                    disp_assign,
+                    budget_unit,
+                    n.electric_room,
+                    n.transformer,
+                    n.notes,
+                    n.category1,
+                    n.category2,
+                    n.category3,
+                    m1,
+                    m2,
+                    m3,
+                    m4,
+                    n.depth
+                ])
+        print('保存しました:', path)
+    except Exception as e:
+        print('保存エラー:', e)
+
+# ---- コントロール群 ----
+control_frame=ttk.Frame(root); control_frame.pack(fill='x')
+row1=ttk.Frame(control_frame); row1.pack(fill='x')
+ttk.Label(row1, text='階層表示: ').pack(side='left', padx=(6,2))
+depth_buttons: Dict[int, tk.Button] = {}
+for d in range(1, MAX_DEPTH+1):
+    btn = tk.Button(row1, text=str(d), width=3, bg=_depth_color(d), activebackground=_depth_color(d), command=lambda dd=d: toggle_depth_view(dd))
+    btn.pack(side='left', padx=2)
+    depth_buttons[d] = btn
+
+ttk.Button(row1, text='全展開', width=8, command=lambda: expand_all_depths()).pack(side='right', padx=6)
+
+def toggle_depth_view(d:int):
+    depth_open_state[d]=not depth_open_state.get(d,True)
+    for i,nid in node_ids.items():
+        if flat_nodes[i].depth==d: tree.item(nid, open=depth_open_state[d])
+
+def expand_all_depths():
+    for d in range(MAX_DEPTH+1): depth_open_state[d]=True
+    for i,nid in node_ids.items(): tree.item(nid, open=True)
+
+row2=ttk.Frame(control_frame); row2.pack(fill='x', pady=(6,0))
+ttk.Button(row2, text='← 階層減', command=lambda: change_depth(False)).pack(side='left')
+ttk.Button(row2, text='→ 階層増', command=lambda: change_depth(True)).pack(side='left')
+ttk.Button(row2, text='＋ ノード追加', command=add_node).pack(side='left')
+ttk.Button(row2, text='－ ノード削除', command=delete_node).pack(side='left')
+ttk.Button(row2, text='↑ 上へ', command=lambda: move_node(True)).pack(side='left')
+ttk.Button(row2, text='↓ 下へ', command=lambda: move_node(False)).pack(side='left')
+ttk.Button(row2, text='量・比率CSV', command=load_measure_master_csv).pack(side='left')
+ttk.Button(row2, text='割り振り先CSV', command=load_distribution_master_csv).pack(side='left')
+ttk.Button(row2, text='ツリーCSV読込', command=load_from_csv).pack(side='left')
+ttk.Button(row2, text='ツリーCSV出力', command=export_to_csv).pack(side='left')
+ttk.Button(row2, text='分析ビュー', command=show_analysis_view).pack(side='left')
+ttk.Button(row2, text='元に戻す', command=undo).pack(side='left')
+ttk.Button(row2, text='やり直し', command=redo).pack(side='left')
+ttk.Button(row2, text='再描画', command=lambda: (lambda s=_snapshot_tree_state(): (draw_tree(), _restore_tree_state(s)))()).pack(side='left')
+# 右端：管理行
+ttk.Button(row2, text='管理行', command=show_management_rows_window).pack(side='right')
+
+# ---- 起動/終了 ----
+
+def on_close():
+    save_config()
+    root.destroy()
+
+load_config()
+root.geometry('1600x900')
+draw_tree()
+_snapshot_widths()
+root.protocol('WM_DELETE_WINDOW', on_close)
+
+if __name__ == '__main__':
+    root.mainloop()
