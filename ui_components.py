@@ -118,6 +118,65 @@ def _simulate_battery_cached(
     )
 
 
+def _sync_step5_battery_state(project: ProjectData) -> None:
+    """Keep STEP5 battery inputs stable across Streamlit reruns."""
+
+    state_signature = (
+        project.updated_at,
+        float(project.battery_params.battery_power_limit_kw),
+        float(project.battery_params.battery_capacity_kwh),
+        float(project.battery_params.battery_initial_energy_kwh),
+    )
+    has_widget_state = all(
+        key in st.session_state
+        for key in (
+            "step5_battery_power_limit_kw",
+            "step5_battery_capacity_kwh",
+            "step5_battery_initial_energy_kwh",
+        )
+    )
+    if st.session_state.get("step5_battery_signature") != state_signature or not has_widget_state:
+        st.session_state.step5_battery_power_limit_kw = float(project.battery_params.battery_power_limit_kw)
+        st.session_state.step5_battery_capacity_kwh = float(project.battery_params.battery_capacity_kwh)
+        st.session_state.step5_battery_initial_energy_kwh = float(project.battery_params.battery_initial_energy_kwh)
+        st.session_state.step5_battery_signature = state_signature
+
+
+def _sync_step1_plan_state(project: ProjectData, plan_key: str) -> None:
+    plan: TariffPlan = getattr(project, plan_key)
+    signature = (
+        project.updated_at,
+        float(plan.basic_rate_yen_per_kw_month),
+        tuple(plan.holiday_list),
+    )
+    state_key = f"{plan_key}_input_signature"
+    has_widget_state = all(
+        key in st.session_state
+        for key in (
+            f"{plan_key}_basic_rate_input",
+            f"{plan_key}_holiday_text",
+        )
+    )
+    if st.session_state.get(state_key) != signature or not has_widget_state:
+        st.session_state[f"{plan_key}_basic_rate_input"] = float(plan.basic_rate_yen_per_kw_month)
+        st.session_state[f"{plan_key}_holiday_text"] = _textarea_holidays(plan.holiday_list)
+        st.session_state[state_key] = signature
+
+
+def _sync_step2_state(project: ProjectData) -> None:
+    signature = (project.updated_at, int(project.target_year))
+    if st.session_state.get("step2_target_year_signature") != signature:
+        st.session_state.step2_target_year = int(project.target_year)
+        st.session_state.step2_target_year_signature = signature
+
+
+def _sync_step4_state(project: ProjectData) -> None:
+    signature = (project.updated_at, tuple(project.operation_holiday_list))
+    if st.session_state.get("step4_operation_holiday_signature") != signature:
+        st.session_state.step4_operation_holiday_text = _textarea_holidays(project.operation_holiday_list)
+        st.session_state.step4_operation_holiday_signature = signature
+
+
 def _textarea_holidays(values: list[str]) -> str:
     return "\n".join(values)
 
@@ -148,18 +207,17 @@ def render_step1(project: ProjectData) -> ProjectData:
     st.subheader("STEP1: 電力量単価を入力する")
     for plan_key in ("planA", "planB"):
         plan: TariffPlan = getattr(project, plan_key)
+        _sync_step1_plan_state(project, plan_key)
         st.markdown(f"#### {plan.name}")
         left, right = st.columns([1, 1.5])
         basic_rate = left.number_input(
             f"{plan.name} 基本料金単価 [円/kW・月]",
             min_value=0.0,
-            value=float(plan.basic_rate_yen_per_kw_month),
             step=10.0,
             key=f"{plan_key}_basic_rate_input",
         )
         holiday_text = right.text_area(
             f"{plan.name} 追加休日一覧",
-            value=_textarea_holidays(plan.holiday_list),
             height=140,
             key=f"{plan_key}_holiday_text",
         )
@@ -172,6 +230,11 @@ def render_step1(project: ProjectData) -> ProjectData:
                 upload_path = _save_uploaded_file(upload, ".csv")
                 plan.tariff_df = load_tariff_csv(upload_path)
             update_project_timestamp(project)
+            st.session_state[f"{plan_key}_input_signature"] = (
+                project.updated_at,
+                float(plan.basic_rate_yen_per_kw_month),
+                tuple(plan.holiday_list),
+            )
             st.success(f"{plan.name} の設定を更新しました。")
     return project
 
@@ -185,8 +248,16 @@ def render_step2(project: ProjectData) -> tuple[ProjectData, Step2Result | None]
     if upload is not None and st.button("電力量CSVを読み込む"):
         upload_path = _save_uploaded_file(upload, ".csv")
         project.energy_df = load_energy_csv(upload_path)
+        source_year = project.energy_df.attrs.get("source_year")
+        source_months = project.energy_df.attrs.get("source_months", [])
+        if source_year is not None:
+            project.target_year = int(source_year)
         update_project_timestamp(project)
-        st.success("電力量CSVを更新しました。")
+        if source_year is not None and source_months:
+            month_text = ", ".join(f"{int(month)}月" for month in source_months)
+            st.success(f"電力量CSVを更新しました。読込期間: {int(source_year)}年 {month_text}")
+        else:
+            st.success("電力量CSVを更新しました。")
 
     step2_result: Step2Result | None = None
     try:
@@ -263,10 +334,55 @@ def render_step5(project: ProjectData) -> tuple[ProjectData, SimulationResult | 
     """STEP5 UI を描画し、シミュレーション結果を返す。"""
 
     st.subheader("STEP5: 蓄電池設定と月毎効果確認")
+    _sync_step5_battery_state(project)
+
+    original_params = (
+        float(project.battery_params.battery_power_limit_kw),
+        float(project.battery_params.battery_capacity_kwh),
+        float(project.battery_params.battery_initial_energy_kwh),
+    )
     upper_cols = st.columns(3)
-    project.battery_params.battery_power_limit_kw = float(upper_cols[0].number_input("充放電能力[kW]", min_value=0.0, value=float(project.battery_params.battery_power_limit_kw), step=50.0))
-    project.battery_params.battery_capacity_kwh = float(upper_cols[1].number_input("充電容量[kWh]", min_value=0.0, value=float(project.battery_params.battery_capacity_kwh), step=100.0))
-    project.battery_params.battery_initial_energy_kwh = float(upper_cols[2].number_input("初期充電量[kWh]", min_value=0.0, value=float(project.battery_params.battery_initial_energy_kwh), step=100.0))
+    battery_power_limit_kw = float(
+        upper_cols[0].number_input(
+            "充放電能力[kW]",
+            min_value=0.0,
+            step=50.0,
+            key="step5_battery_power_limit_kw",
+        )
+    )
+    battery_capacity_kwh = float(
+        upper_cols[1].number_input(
+            "充電容量[kWh]",
+            min_value=0.0,
+            step=100.0,
+            key="step5_battery_capacity_kwh",
+        )
+    )
+    battery_initial_energy_kwh = float(
+        upper_cols[2].number_input(
+            "初期充電量[kWh]",
+            min_value=0.0,
+            step=100.0,
+            key="step5_battery_initial_energy_kwh",
+        )
+    )
+
+    project.battery_params.battery_power_limit_kw = battery_power_limit_kw
+    project.battery_params.battery_capacity_kwh = battery_capacity_kwh
+    project.battery_params.battery_initial_energy_kwh = battery_initial_energy_kwh
+    updated_params = (
+        battery_power_limit_kw,
+        battery_capacity_kwh,
+        battery_initial_energy_kwh,
+    )
+    if updated_params != original_params:
+        update_project_timestamp(project)
+        st.session_state.step5_battery_signature = (
+            project.updated_at,
+            battery_power_limit_kw,
+            battery_capacity_kwh,
+            battery_initial_energy_kwh,
+        )
 
     control_cols = st.columns(3)
     month = int(control_cols[0].selectbox("編集する月", options=list(range(1, 13)), index=0))

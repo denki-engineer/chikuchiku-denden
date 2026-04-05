@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import unicodedata
 import zipfile
 from dataclasses import asdict
@@ -25,6 +26,17 @@ SCHEDULE_DAY_LABELS = ("稼働日", "休業日")
 SCHEDULE_MODES = ("固定(kW)", "GRID目標(kW)", "容量目標(kWh)")
 
 
+def _read_csv_with_fallback(path: str, **kwargs) -> pd.DataFrame:
+    """Read CSV using utf-8-sig first, then cp932 as a fallback."""
+
+    for encoding in ("utf-8-sig", "cp932"):
+        try:
+            return pd.read_csv(path, encoding=encoding, **kwargs)
+        except UnicodeDecodeError:
+            continue
+    return pd.read_csv(path, encoding="utf-8-sig", **kwargs)
+
+
 def _normalize_time_slot(value: str) -> str:
     start_text, end_text = str(value).strip().split("-")
     start_hour, start_minute = [int(part) for part in start_text.split(":")]
@@ -34,10 +46,7 @@ def _normalize_time_slot(value: str) -> str:
     return f"{start}-{end}"
 
 
-def load_tariff_csv(path: str) -> pd.DataFrame:
-    """tariff CSV を読み込みバリデーションする。"""
-
-    df = pd.read_csv(path, encoding="utf-8-sig")
+def _validate_tariff_df(df: pd.DataFrame) -> pd.DataFrame:
     required = ["month", "day_type", "time_slot", "unit_price"]
     missing = [column for column in required if column not in df.columns]
     if missing:
@@ -59,16 +68,35 @@ def load_tariff_csv(path: str) -> pd.DataFrame:
     return df.sort_values(["month", "day_type", "time_slot"]).reset_index(drop=True)
 
 
-def save_tariff_csv(df: pd.DataFrame, path: str) -> None:
-    """tariff CSV を保存する。"""
+def _convert_wide_tariff_csv(df: pd.DataFrame) -> pd.DataFrame:
+    normalized_columns = [unicodedata.normalize("NFKC", str(column)).strip() for column in df.columns]
+    df = df.copy()
+    df.columns = normalized_columns
+    time_slot_column = normalized_columns[0]
+    records: list[dict[str, object]] = []
+    pattern = re.compile(r"^(\d{1,2})月(平日|休日)$")
 
-    df.to_csv(path, index=False, encoding="utf-8-sig")
+    for _, row in df.iterrows():
+        time_slot = _normalize_time_slot(row[time_slot_column])
+        for column in normalized_columns[1:]:
+            match = pattern.match(column)
+            if match is None:
+                continue
+            month = int(match.group(1))
+            day_type = "weekday" if match.group(2) == "平日" else "holiday"
+            records.append(
+                {
+                    "month": month,
+                    "day_type": day_type,
+                    "time_slot": time_slot,
+                    "unit_price": row[column],
+                }
+            )
+
+    return pd.DataFrame.from_records(records)
 
 
-def load_energy_csv(path: str) -> pd.DataFrame:
-    """電力量CSVを読み込み、時系列検証を行う。"""
-
-    df = pd.read_csv(path, encoding="utf-8-sig")
+def _validate_energy_df(df: pd.DataFrame) -> pd.DataFrame:
     required = ["date", "time", "kWh"]
     missing = [column for column in required if column not in df.columns]
     if missing:
@@ -86,7 +114,82 @@ def load_energy_csv(path: str) -> pd.DataFrame:
     if len(missing_range) > 0:
         raise ValueError(f"電力量CSVに欠損日時があります。最初の欠損は {missing_range[0]} です。")
     df["original_grid_kw_30min_avg"] = df["kWh"] * 2
+    df.attrs["source_year"] = int(df["datetime"].dt.year.mode().iloc[0])
+    df.attrs["source_months"] = sorted(df["datetime"].dt.month.unique().tolist())
     return df
+
+
+def _convert_monthly_energy_report(raw_df: pd.DataFrame) -> pd.DataFrame:
+    title_cell = unicodedata.normalize("NFKC", str(raw_df.iat[0, 0])).strip()
+    match = re.search(r"(\d{4})年(\d{1,2})月分", title_cell)
+    if match is None:
+        raise ValueError("電力使用量CSVの先頭から 年/月 を読み取れませんでした。")
+    year = int(match.group(1))
+    month = int(match.group(2))
+
+    header_row = raw_df.iloc[2].map(lambda value: unicodedata.normalize("NFKC", str(value)).strip())
+    day_columns: list[tuple[int, int]] = []
+    for column_index in range(2, len(header_row)):
+        header_value = header_row.iloc[column_index]
+        if header_value.startswith("合計"):
+            break
+        day_match = re.match(r"(\d{1,2})日", header_value)
+        if day_match is None:
+            continue
+        day_columns.append((column_index, int(day_match.group(1))))
+
+    records: list[dict[str, object]] = []
+    for row_index in range(3, len(raw_df)):
+        time_slot_raw = unicodedata.normalize("NFKC", str(raw_df.iat[row_index, 1])).strip()
+        if "-" not in time_slot_raw:
+            continue
+        time_slot = _normalize_time_slot(time_slot_raw)
+        start_time = time_slot.split("-")[0]
+        for column_index, day in day_columns:
+            value = raw_df.iat[row_index, column_index]
+            if pd.isna(value) or str(value).strip() == "":
+                continue
+            records.append(
+                {
+                    "date": f"{year:04d}-{month:02d}-{day:02d}",
+                    "time": start_time,
+                    "kWh": value,
+                }
+            )
+
+    if not records:
+        raise ValueError("電力使用量CSVから30分データを抽出できませんでした。")
+
+    df = pd.DataFrame.from_records(records)
+    df.attrs["source_year"] = year
+    df.attrs["source_months"] = [month]
+    return df
+
+
+def load_tariff_csv(path: str) -> pd.DataFrame:
+    """tariff CSV を読み込みバリデーションする。"""
+
+    df = _read_csv_with_fallback(path)
+    if {"month", "day_type", "time_slot", "unit_price"}.issubset(df.columns):
+        return _validate_tariff_df(df)
+    return _validate_tariff_df(_convert_wide_tariff_csv(df))
+
+
+def save_tariff_csv(df: pd.DataFrame, path: str) -> None:
+    """tariff CSV を保存する。"""
+
+    df.to_csv(path, index=False, encoding="utf-8-sig")
+
+
+def load_energy_csv(path: str) -> pd.DataFrame:
+    """電力量CSVを読み込み、時系列検証を行う。"""
+
+    df = _read_csv_with_fallback(path)
+    if {"date", "time", "kWh"}.issubset(df.columns):
+        return _validate_energy_df(df)
+    raw_df = _read_csv_with_fallback(path, header=None)
+    converted_df = _convert_monthly_energy_report(raw_df)
+    return _validate_energy_df(converted_df)
 
 
 def save_energy_csv(df: pd.DataFrame, path: str) -> None:

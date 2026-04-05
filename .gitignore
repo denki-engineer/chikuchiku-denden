@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+
+# Build artifacts
+build/
+dist/
+release/*
+!release/.gitkeep
+
+# Local temp files
+.codex_tmp/
+*.tmp
+*.log
+
+# Test / lint cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Archives and local exports
+*.zip
+*.bak
+*.xlsx
+*.xls
+
+# Do not commit local business CSV exports
+*電力使用量*.csv
+*電気料金*.csv
+*充放電スケジュール*.csv

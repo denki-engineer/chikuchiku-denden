@@ -2,9 +2,19 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import streamlit as st
+
+
+def get_runtime_base_dir() -> Path:
+    """Return the directory that contains bundled app resources."""
+
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+    return Path(__file__).resolve().parent
+
 
 try:
     from chikuchiku_denden.calculators import calculate_step2, calculate_step3
@@ -35,7 +45,7 @@ except ModuleNotFoundError:  # app.py ?????????????????
         render_top_summary,
     )
 
-DEFAULTS_DIR = Path(__file__).resolve().parent / "defaults"
+DEFAULTS_DIR = get_runtime_base_dir() / "defaults"
 STEP_NAMES = ["STEP1", "STEP2", "STEP3", "STEP4", "STEP5", "STEP6"]
 DEFAULT_STEP3_TARGET_KW = 350.0
 
@@ -80,6 +90,8 @@ def initialize_session_state() -> None:
         st.session_state.simulation_result = None
     if "active_step" not in st.session_state:
         st.session_state.active_step = "STEP1"
+    if "active_step_selector" not in st.session_state:
+        st.session_state.active_step_selector = st.session_state.active_step
     if "step2_signature" not in st.session_state:
         st.session_state.step2_signature = None
     if "step3_signature" not in st.session_state:
@@ -122,7 +134,13 @@ def main() -> None:
     st.caption("料金プラン比較・蓄電池導入効果の概算評価アプリ")
     render_top_summary(step2_result, step3_result)
 
-    st.radio("表示するSTEP", STEP_NAMES, key="active_step", horizontal=True)
+    selected_step = st.radio(
+        "表示するSTEP",
+        STEP_NAMES,
+        key="active_step_selector",
+        horizontal=True,
+    )
+    st.session_state.active_step = selected_step
 
     if st.session_state.active_step == "STEP1":
         st.session_state.project = render_step1(project)
