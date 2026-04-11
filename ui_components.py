@@ -188,7 +188,8 @@ def _save_uploaded_file(uploaded_file, suffix: str) -> str:
 
 
 def _download_csv_button(label: str, df: pd.DataFrame, file_name: str) -> None:
-    st.download_button(label=label, data=df.to_csv(index=False, encoding="utf-8-sig"), file_name=file_name, mime="text/csv")
+    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(label=label, data=csv_bytes, file_name=file_name, mime="text/csv; charset=utf-8")
 
 
 def render_top_summary(step2_result: Step2Result | None, step3_result: Step3Result | None) -> None:
